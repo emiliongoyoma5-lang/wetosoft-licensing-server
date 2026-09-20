@@ -1,7 +1,7 @@
 import { neon } from '@neondatabase/serverless';
 import { SignJWT, importJWK } from 'jose';
-import { createHash } from 'node:crypto';
-import { randomToken, sha256, verifyPassword } from './auth.mjs';
+import { createHash, timingSafeEqual } from 'node:crypto';
+import { hashPassword, randomToken, sha256, verifyPassword } from './auth.mjs';
 
 const json = (statusCode, body, extra={}) => ({ statusCode, headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store', ...extra }, body: JSON.stringify(body) });
 const getDb = () => { if (!process.env.DATABASE_URL) throw new Error('DATABASE_URL_MISSING'); return neon(process.env.DATABASE_URL); };
@@ -28,6 +28,65 @@ async function signLicense(license, tenant, plan, installationId) {
   const key = await importJWK(JSON.parse(raw), 'EdDSA');
   return new SignJWT({ typ:'WetoSoftLicense', tenantId:tenant.id, company:tenant.legal_name, email:tenant.email, plan:plan.code, licenseId:license.id, installationId, startsAt:new Date(license.starts_at).toISOString(), expiresAt:new Date(license.expires_at).toISOString(), features:license.features })
     .setProtectedHeader({alg:'EdDSA',kid:'wetosoft-license-1'}).setIssuer(process.env.LICENSE_ISSUER).setAudience(process.env.LICENSE_AUDIENCE).setIssuedAt().setJti(license.id).sign(key);
+}
+
+
+function header(event, name) {
+  const headers = event.headers || {};
+  const key = Object.keys(headers).find(k => k.toLowerCase() === name.toLowerCase());
+  return key ? String(headers[key] || '') : '';
+}
+
+function secretMatches(provided, expected) {
+  if (!provided || !expected) return false;
+  const a = createHash('sha256').update(provided, 'utf8').digest();
+  const b = createHash('sha256').update(expected, 'utf8').digest();
+  return timingSafeEqual(a, b);
+}
+
+async function bootstrapAdmin(event) {
+  const configured = process.env.ADMIN_BOOTSTRAP_SECRET;
+  if (!configured) return json(503, { error: 'BOOTSTRAP_NOT_CONFIGURED' });
+
+  const provided = header(event, 'x-bootstrap-secret');
+  if (!secretMatches(provided, configured)) return json(401, { error: 'INVALID_BOOTSTRAP_SECRET' });
+
+  const input = body(event);
+  if (!input?.username || !input?.password) return json(400, { error: 'INVALID_REQUEST' });
+  const username = String(input.username).trim();
+  const password = String(input.password);
+  if (!/^[A-Za-z0-9._-]{3,64}$/.test(username)) return json(400, { error: 'INVALID_USERNAME' });
+  if (password.length < 12) return json(400, { error: 'PASSWORD_TOO_SHORT' });
+
+  const db = getDb();
+  const passwordHash = await hashPassword(password);
+  const rows = await db`
+    WITH claimed AS (
+      UPDATE admin_bootstrap
+      SET claimed_at=now()
+      WHERE id=1 AND claimed_at IS NULL AND NOT EXISTS (SELECT 1 FROM admin_users)
+      RETURNING id
+    ), inserted AS (
+      INSERT INTO admin_users(username,password_hash,role)
+      SELECT ${username},${passwordHash},'SUPER_ADMIN' FROM claimed
+      RETURNING id,username,role
+    )
+    SELECT * FROM inserted`;
+
+  if (!rows.length) return json(409, { error: 'BOOTSTRAP_ALREADY_COMPLETED' });
+
+  const user = rows[0];
+  const token = randomToken(32);
+  await db`
+    INSERT INTO admin_sessions(admin_user_id,token_hash,expires_at)
+    VALUES(${user.id},${sha256(token)},now()+interval '8 hours')`;
+  await db`
+    INSERT INTO license_events(event,metadata)
+    VALUES('ADMIN_BOOTSTRAP',${JSON.stringify({adminUserId:user.id,username:user.username})}::jsonb)`;
+
+  return json(201, { user: { id:user.id, username:user.username, role:user.role }, expiresIn:28800 }, {
+    'set-cookie': `ws_admin_session=${encodeURIComponent(token)}; Path=/; Max-Age=28800; HttpOnly; Secure; SameSite=Strict`
+  });
 }
 
 async function login(event) {
@@ -75,5 +134,4 @@ async function adminCreateCode(event){const a=await adminSession(event,['SUPER_A
 async function adminListLicenses(event){const a=await adminSession(event);if(!a)return json(401,{error:'UNAUTHORIZED'});const db=getDb();return json(200,{items:await db`SELECT l.id,l.tenant_id,t.legal_name,p.code plan,l.starts_at,l.expires_at,l.status FROM licenses l JOIN tenants t ON t.id=l.tenant_id JOIN plans p ON p.id=l.plan_id ORDER BY l.created_at DESC LIMIT 200`});}
 async function adminRevoke(event){const a=await adminSession(event,['SUPER_ADMIN','ADMIN']);if(!a)return json(401,{error:'UNAUTHORIZED'});const i=body(event);if(!i?.licenseId)return json(400,{error:'INVALID_REQUEST'});const db=getDb();const r=await db`UPDATE licenses SET status='REVOKED',updated_at=now() WHERE id=${i.licenseId} RETURNING id,tenant_id`;if(!r.length)return json(404,{error:'LICENSE_NOT_FOUND'});await db`UPDATE installations SET status='REVOKED' WHERE license_id=${i.licenseId}`;await db`UPDATE activation_codes SET status='REVOKED' WHERE license_id=${i.licenseId} AND status='UNUSED'`;await db`INSERT INTO license_events(license_id,tenant_id,event,metadata) VALUES(${r[0].id},${r[0].tenant_id},'REVOKED',${JSON.stringify({adminUserId:a.id})}::jsonb)`;return json(200,{ok:true});}
 
-export const handler=async event=>{try{if(event.httpMethod==='OPTIONS')return{statusCode:204,headers:{'access-control-allow-origin':'*','access-control-allow-methods':'GET,POST,OPTIONS','access-control-allow-headers':'content-type,authorization'},body:''};const path=(event.path||'').replace(/\/+/g,'/');if(path.endsWith('/auth/login')&&event.httpMethod==='POST')return login(event);if(path.endsWith('/auth/logout')&&event.httpMethod==='POST')return logout(event);if(event.httpMethod!=='POST'&&event.httpMethod!=='GET')return json(405,{error:'METHOD_NOT_ALLOWED'});if(path.endsWith('/activation'))return activation(event);if(path.endsWith('/license/refresh'))return refresh(event);if(path.endsWith('/license/status'))return status(event);if(path.endsWith('/admin/tenant')&&event.httpMethod==='POST')return adminCreateTenant(event);if(path.endsWith('/admin/tenants')&&event.httpMethod==='GET')return adminListTenants(event);if(path.endsWith('/admin/activation-code'))return adminCreateCode(event);if(path.endsWith('/admin/licenses')&&event.httpMethod==='GET')return adminListLicenses(event);if(path.endsWith('/admin/license/revoke'))return adminRevoke(event);return json(404,{error:'NOT_FOUND'});}catch(error){console.error('licensing-api-error',error);return json(500,{error:'INTERNAL_ERROR'});}};
-  
+export const handler=async event=>{try{if(event.httpMethod==='OPTIONS')return{statusCode:204,headers:{'access-control-allow-origin':'*','access-control-allow-methods':'GET,POST,OPTIONS','access-control-allow-headers':'content-type,authorization'},body:''};const path=(event.path||'').replace(/\/+/g,'/');if(path.endsWith('/auth/login')&&event.httpMethod==='POST')return login(event);if(path.endsWith('/admin/bootstrap')&&event.httpMethod==='POST')return bootstrapAdmin(event);if(path.endsWith('/auth/logout')&&event.httpMethod==='POST')return logout(event);if(event.httpMethod!=='POST'&&event.httpMethod!=='GET')return json(405,{error:'METHOD_NOT_ALLOWED'});if(path.endsWith('/activation'))return activation(event);if(path.endsWith('/license/refresh'))return refresh(event);if(path.endsWith('/license/status'))return status(event);if(path.endsWith('/admin/tenant')&&event.httpMethod==='POST')return adminCreateTenant(event);if(path.endsWith('/admin/tenants')&&event.httpMethod==='GET')return adminListTenants(event);if(path.endsWith('/admin/activation-code'))return adminCreateCode(event);if(path.endsWith('/admin/licenses')&&event.httpMethod==='GET')return adminListLicenses(event);if(path.endsWith('/admin/license/revoke'))return adminRevoke(event);return json(404,{error:'NOT_FOUND'});}catch(error){console.error('licensing-api-error',error);return json(500,{error:'INTERNAL_ERROR'});}};
