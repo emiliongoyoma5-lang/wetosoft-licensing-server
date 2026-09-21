@@ -49,7 +49,7 @@ async function bootstrapAdmin(event) {
   if (!configured) return json(503, { error: 'BOOTSTRAP_NOT_CONFIGURED' });
 
   const provided = header(event, 'x-bootstrap-secret');
-  if (!secretMatches(provided, configured)) return json(401, { error: 'INVALID_BOOTSTRAP_SECRET' });
+  if (!secretMatches(provided, configured)) return json(401, { error: 'INVALID_BOOTSTRAP_SECRET', diagnostic: { providedLength: provided.length, configuredLength: configured.length, providedTrimmedLength: provided.trim().length, configuredTrimmedLength: configured.trim().length, exactMatch: provided === configured, trimmedMatch: provided.trim() === configured.trim(), providedHasLeadingWhitespace: /^\s/.test(provided), providedHasTrailingWhitespace: /\s$/.test(provided), configuredHasLeadingWhitespace: /^\s/.test(configured), configuredHasTrailingWhitespace: /\s$/.test(configured) } });
 
   const input = body(event);
   if (!input?.username || !input?.password) return json(400, { error: 'INVALID_REQUEST' });
