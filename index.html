@@ -1,20 +1,218 @@
-<!doctype html><html lang="pt-AO"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>WetoSoft — Administração</title><style>body{font-family:system-ui,sans-serif;max-width:1050px;margin:30px auto;padding:0 18px}input,select,button{padding:9px;margin:4px 0}section{border:1px solid #ddd;border-radius:10px;padding:16px;margin:14px 0}pre{white-space:pre-wrap;background:#f5f5f5;padding:10px;overflow:auto}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:8px}.hidden{display:none}</style></head><body>
-<h1>WetoSoft — Administração</h1><p>Gestão central de empresas e licenças.</p>
-<section id="setup"><h2>Primeiro administrador</h2><p>Use esta área apenas uma vez. O segredo de bootstrap é enviado por HTTPS e nunca é armazenado no navegador.</p><input id="setupSecret" type="password" autocomplete="off" placeholder="Segredo de bootstrap"><input id="setupUser" autocomplete="username" placeholder="Novo utilizador"><input id="setupPass" type="password" autocomplete="new-password" placeholder="Palavra-passe (mín. 12 caracteres)"><button id="setupBtn">Criar administrador</button><pre id="setupOut"></pre></section>
-<section id="login"><h2>Acesso</h2><input id="user" autocomplete="username" placeholder="Utilizador"><input id="pass" type="password" autocomplete="current-password" placeholder="Palavra-passe"><button id="loginBtn">Entrar</button><pre id="loginOut"></pre></section>
+<!doctype html>
+<html lang="pt-AO">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>WetoSoft — Administração</title>
+<style>
+body{font-family:system-ui,sans-serif;max-width:1050px;margin:30px auto;padding:0 18px}
+input,select,button{padding:9px;margin:4px 0}
+section{border:1px solid #ddd;border-radius:10px;padding:16px;margin:14px 0}
+pre{white-space:pre-wrap;background:#f5f5f5;padding:10px;overflow:auto}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:8px}
+.hidden{display:none}
+</style>
+</head>
+<body>
+<h1>WetoSoft — Administração</h1>
+<p>Gestão central de empresas e licenças.</p>
+
+<section id="setup">
+<h2>Primeiro administrador</h2>
+<p>Use esta área apenas uma vez. Depois de criado o primeiro administrador, esta área fica bloqueada.</p>
+<input id="setupSecret" type="password" autocomplete="off" placeholder="Segredo de bootstrap">
+<input id="setupUser" autocomplete="username" placeholder="Novo utilizador">
+<input id="setupPass" type="password" autocomplete="new-password" placeholder="Palavra-passe (mín. 12 caracteres)">
+<button id="setupBtn">Criar administrador</button>
+<pre id="setupOut"></pre>
+</section>
+
+<section id="login">
+<h2>Acesso</h2>
+<input id="user" autocomplete="username" placeholder="Utilizador">
+<input id="pass" type="password" autocomplete="current-password" placeholder="Palavra-passe">
+<button id="loginBtn">Entrar</button>
+<pre id="loginOut"></pre>
+</section>
+
 <div id="app" class="hidden">
 <section><button id="logout">Sair</button> <span id="who"></span></section>
-<section><h2>Nova empresa</h2><div class="grid"><input id="legal" placeholder="Nome legal"><input id="email" type="email" placeholder="Email"><input id="nif" placeholder="NIF"></div><button id="tenantBtn">Criar empresa</button><pre id="tenantOut"></pre></section>
-<section><h2>Gerar ativação</h2><div class="grid"><input id="tenantId" placeholder="Tenant ID"><select id="plan"><option>QUARTERLY</option><option>SEMIANNUAL</option><option selected>ANNUAL</option></select></div><button id="codeBtn">Gerar código</button><pre id="codeOut"></pre></section>
-<section><h2>Licenças</h2><button id="refreshBtn">Atualizar</button><pre id="licenses"></pre></section>
-<section><h2>Revogar</h2><input id="licenseId" placeholder="License ID"><button id="revokeBtn">Revogar</button><pre id="revokeOut"></pre></section>
-</div><script>
-let authenticated=false;
-const req=async(path,opt={})=>{const h={'content-type':'application/json',...(opt.headers||{})};const r=await fetch('/api/v1/'+path,{...opt,headers:h});let b={};try{b=await r.json()}catch{};if(r.status===401){authenticated=false;show(false)}return {status:r.status,body:b}};
-const show=on=>{document.querySelector('#login').classList.toggle('hidden',on);document.querySelector('#app').classList.toggle('hidden',!on)};
-async function bootstrap(){const secret=document.querySelector('#setupSecret').value;const username=document.querySelector('#setupUser').value;const password=document.querySelector('#setupPass').value;const r=await req('admin/bootstrap',{method:'POST',headers:{'x-bootstrap-secret':secret},body:JSON.stringify({username,password})});document.querySelector('#setupOut').textContent=JSON.stringify(r.body,null,2);if(r.status===201){document.querySelector('#user').value=username;document.querySelector('#pass').value=password;document.querySelector('#setupSecret').value='';document.querySelector('#setup').classList.add('hidden');authenticated=true;document.querySelector('#who').textContent=r.body.user.username+' — '+r.body.user.role;show(true);load()}}
-async function login(){const r=await req('auth/login',{method:'POST',body:JSON.stringify({username:document.querySelector('#user').value,password:document.querySelector('#pass').value})});if(r.status===200){authenticated=true;document.querySelector('#who').textContent=r.body.user.username+' — '+r.body.user.role;show(true);load()}else document.querySelector('#loginOut').textContent=JSON.stringify(r.body,null,2)}
-async function load(){const r=await req('admin/licenses');document.querySelector('#licenses').textContent=JSON.stringify(r.body,null,2)}
-document.querySelector('#setupBtn').onclick=bootstrap;document.querySelector('#loginBtn').onclick=login;document.querySelector('#logout').onclick=async()=>{await req('auth/logout',{method:'POST'});authenticated=false;show(false)};document.querySelector('#tenantBtn').onclick=async()=>{const r=await req('admin/tenant',{method:'POST',body:JSON.stringify({legalName:legal.value,email:email.value,nif:nif.value})});tenantOut.textContent=JSON.stringify(r.body,null,2);if(r.body.id)tenantId.value=r.body.id};document.querySelector('#codeBtn').onclick=async()=>{const r=await req('admin/activation-code',{method:'POST',body:JSON.stringify({tenantId:tenantId.value,planCode:plan.value})});codeOut.textContent=JSON.stringify(r.body,null,2)};document.querySelector('#refreshBtn').onclick=load;document.querySelector('#revokeBtn').onclick=async()=>{const r=await req('admin/license/revoke',{method:'POST',body:JSON.stringify({licenseId:licenseId.value})});revokeOut.textContent=JSON.stringify(r.body,null,2);load()};
-show(false);
-</script></body></html>
+
+<section>
+<h2>Nova empresa</h2>
+<div class="grid">
+<input id="legal" placeholder="Nome legal">
+<input id="email" type="email" placeholder="Email">
+<input id="nif" placeholder="NIF">
+</div>
+<button id="tenantBtn">Criar empresa</button>
+<pre id="tenantOut"></pre>
+</section>
+
+<section>
+<h2>Gerar ativação</h2>
+<div class="grid">
+<input id="tenantId" placeholder="Tenant ID">
+<select id="plan"><option>QUARTERLY</option><option>SEMIANNUAL</option><option selected>ANNUAL</option></select>
+</div>
+<button id="codeBtn">Gerar código</button>
+<pre id="codeOut"></pre>
+</section>
+
+<section>
+<h2>Licenças</h2>
+<button id="refreshBtn">Atualizar</button>
+<pre id="licenses"></pre>
+</section>
+
+<section>
+<h2>Revogar</h2>
+<input id="licenseId" placeholder="License ID">
+<button id="revokeBtn">Revogar</button>
+<pre id="revokeOut"></pre>
+</section>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+let authenticated = false;
+
+const show = on => {
+  $('login').classList.toggle('hidden', on);
+  $('app').classList.toggle('hidden', !on);
+};
+
+const setWho = user => {
+  $('who').textContent = `${user.username} — ${user.role}`;
+};
+
+const req = async (path, opt = {}) => {
+  const headers = {'content-type':'application/json', ...(opt.headers || {})};
+  const r = await fetch('/api/v1/' + path, {
+    ...opt,
+    credentials: 'same-origin',
+    headers
+  });
+  let body = {};
+  try { body = await r.json(); } catch {}
+  if (r.status === 401) {
+    authenticated = false;
+    show(false);
+  }
+  return {status:r.status, body};
+};
+
+async function bootstrapStatus(){
+  const r = await req('admin/bootstrap-status', {method:'GET'});
+  if (r.status === 200 && r.body.completed) {
+    $('setup').classList.add('hidden');
+  } else if (r.status === 200) {
+    $('setup').classList.remove('hidden');
+  }
+}
+
+async function restoreSession(){
+  const r = await req('admin/me', {method:'GET'});
+  if (r.status === 200 && r.body.user) {
+    authenticated = true;
+    setWho(r.body.user);
+    show(true);
+    await load();
+    return true;
+  }
+  authenticated = false;
+  show(false);
+  return false;
+}
+
+async function bootstrap(){
+  const secret = $('setupSecret').value;
+  const username = $('setupUser').value.trim();
+  const password = $('setupPass').value;
+  const r = await req('admin/bootstrap', {
+    method:'POST',
+    headers:{'x-bootstrap-secret':secret},
+    body:JSON.stringify({username,password})
+  });
+  $('setupOut').textContent = JSON.stringify(r.body,null,2);
+
+  $('setupSecret').value = '';
+  $('setupPass').value = '';
+
+  if (r.status === 201) {
+    $('setup').classList.add('hidden');
+    $('user').value = username;
+    $('pass').value = '';
+    authenticated = true;
+    setWho(r.body.user);
+    show(true);
+    await load();
+  } else if (r.body?.error === 'BOOTSTRAP_ALREADY_COMPLETED') {
+    $('setup').classList.add('hidden');
+  }
+}
+
+async function login(){
+  const username = $('user').value.trim();
+  const password = $('pass').value;
+  const r = await req('auth/login', {
+    method:'POST',
+    body:JSON.stringify({username,password})
+  });
+  $('pass').value = '';
+  if (r.status === 200) {
+    authenticated = true;
+    setWho(r.body.user);
+    show(true);
+    await load();
+  } else {
+    $('loginOut').textContent = JSON.stringify(r.body,null,2);
+  }
+}
+
+async function load(){
+  const r = await req('admin/licenses', {method:'GET'});
+  $('licenses').textContent = JSON.stringify(r.body,null,2);
+}
+
+$('setupBtn').onclick = bootstrap;
+$('loginBtn').onclick = login;
+$('logout').onclick = async () => {
+  await req('auth/logout',{method:'POST'});
+  authenticated = false;
+  $('pass').value = '';
+  show(false);
+};
+$('tenantBtn').onclick = async () => {
+  const r = await req('admin/tenant', {
+    method:'POST',
+    body:JSON.stringify({legalName:$('legal').value.trim(),email:$('email').value.trim(),nif:$('nif').value.trim()})
+  });
+  $('tenantOut').textContent = JSON.stringify(r.body,null,2);
+  if (r.body.id) $('tenantId').value = r.body.id;
+};
+$('codeBtn').onclick = async () => {
+  const r = await req('admin/activation-code', {
+    method:'POST',
+    body:JSON.stringify({tenantId:$('tenantId').value.trim(),planCode:$('plan').value})
+  });
+  $('codeOut').textContent = JSON.stringify(r.body,null,2);
+};
+$('refreshBtn').onclick = load;
+$('revokeBtn').onclick = async () => {
+  const r = await req('admin/license/revoke', {
+    method:'POST',
+    body:JSON.stringify({licenseId:$('licenseId').value.trim()})
+  });
+  $('revokeOut').textContent = JSON.stringify(r.body,null,2);
+  await load();
+};
+
+(async () => {
+  show(false);
+  await bootstrapStatus();
+  await restoreSession();
+})();
+</script>
+</body>
+</html>
