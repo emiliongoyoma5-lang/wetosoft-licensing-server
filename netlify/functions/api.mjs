@@ -359,23 +359,32 @@ async function activation(event) {
   if (candidates.length) {
     const target = candidates[0];
 
-    if (
-      target.tenant_status !== 'ACTIVE' ||
-      target.license_status !== 'ACTIVE' ||
-      new Date(target.expires_at).getTime() <= Date.now()
-    ) {
-      if (
-        target.license_status === 'ACTIVE' &&
-        new Date(target.expires_at).getTime() <= Date.now()
-      ) {
-        await db`
-          UPDATE licenses
-          SET status = 'EXPIRED', updated_at = now()
-          WHERE id = ${target.license_id}
-            AND status = 'ACTIVE'
-        `;
-      }
+    if (target.tenant_status === 'CLOSED') {
+      return json(403, { error: 'TENANT_CLOSED' });
+    }
+    if (target.tenant_status !== 'ACTIVE') {
+      return json(403, { error: 'TENANT_SUSPENDED' });
+    }
+    if (target.license_status === 'REVOKED') {
+      return json(403, { error: 'LICENSE_REVOKED' });
+    }
+    if (target.license_status === 'SUSPENDED') {
+      return json(403, { error: 'LICENSE_SUSPENDED' });
+    }
+    if (target.license_status !== 'ACTIVE') {
       return json(403, { error: 'LICENSE_NOT_ACTIVE' });
+    }
+    if (new Date(target.starts_at).getTime() > Date.now()) {
+      return json(403, { error: 'LICENSE_NOT_STARTED' });
+    }
+    if (new Date(target.expires_at).getTime() <= Date.now()) {
+      await db`
+        UPDATE licenses
+        SET status = 'EXPIRED', updated_at = now()
+        WHERE id = ${target.license_id}
+          AND status = 'ACTIVE'
+      `;
+      return json(403, { error: 'LICENSE_EXPIRED' });
     }
 
     let token;
@@ -410,6 +419,7 @@ async function activation(event) {
             WHERE l.id = ${target.license_id}
               AND l.status = 'ACTIVE'
               AND t.status = 'ACTIVE'
+              AND l.starts_at <= now()
               AND l.expires_at > now()
           )
         RETURNING license_id
@@ -484,12 +494,42 @@ async function activation(event) {
 
   const existing = used[0];
 
+  if (existing.code_status === 'REVOKED') {
+    return json(409, { error: 'ACTIVATION_CODE_REVOKED' });
+  }
+
   if (existing.code_status === 'ACTIVATED' &&
-      existing.installation_id === installationId &&
-      existing.installation_status === 'ACTIVE' &&
-      existing.license_status === 'ACTIVE' &&
-      existing.tenant_status === 'ACTIVE' &&
-      new Date(existing.expires_at).getTime() > Date.now()) {
+      existing.installation_id === installationId) {
+    if (existing.tenant_status === 'CLOSED') {
+      return json(403, { error: 'TENANT_CLOSED' });
+    }
+    if (existing.tenant_status !== 'ACTIVE') {
+      return json(403, { error: 'TENANT_SUSPENDED' });
+    }
+    if (existing.license_status === 'REVOKED') {
+      return json(403, { error: 'LICENSE_REVOKED' });
+    }
+    if (existing.license_status === 'SUSPENDED') {
+      return json(403, { error: 'LICENSE_SUSPENDED' });
+    }
+    if (existing.license_status !== 'ACTIVE') {
+      return json(403, { error: 'LICENSE_NOT_ACTIVE' });
+    }
+    if (new Date(existing.starts_at).getTime() > Date.now()) {
+      return json(403, { error: 'LICENSE_NOT_STARTED' });
+    }
+    if (new Date(existing.expires_at).getTime() <= Date.now()) {
+      await db`
+        UPDATE licenses
+        SET status = 'EXPIRED', updated_at = now()
+        WHERE id = ${existing.id}
+          AND status = 'ACTIVE'
+      `;
+      return json(403, { error: 'LICENSE_EXPIRED' });
+    }
+    if (existing.installation_status !== 'ACTIVE') {
+      return json(403, { error: 'INSTALLATION_NOT_ACTIVE' });
+    }
     let token;
     try {
       token = await signLicense(
@@ -523,25 +563,8 @@ async function activation(event) {
     });
   }
 
-  if (
-    existing.license_status === 'ACTIVE' &&
-    new Date(existing.expires_at).getTime() <= Date.now()
-  ) {
-    await db`
-      UPDATE licenses
-      SET status = 'EXPIRED', updated_at = now()
-      WHERE id = ${existing.id}
-        AND status = 'ACTIVE'
-    `;
-    return json(403, { error: 'LICENSE_EXPIRED' });
-  }
-
   if (existing.code_status === 'ACTIVATED') {
     return json(409, { error: 'ACTIVATION_CODE_ALREADY_USED' });
-  }
-
-  if (existing.code_status === 'REVOKED') {
-    return json(409, { error: 'ACTIVATION_CODE_REVOKED' });
   }
 
   return json(403, { error: 'LICENSE_NOT_ACTIVE' });
@@ -590,8 +613,23 @@ async function refresh(event) {
 
   const license = rows[0];
 
-  if (license.tenant_status !== 'ACTIVE' || license.status !== 'ACTIVE') {
+  if (license.tenant_status === 'CLOSED') {
+    return json(403, { error: 'TENANT_CLOSED' });
+  }
+  if (license.tenant_status !== 'ACTIVE') {
+    return json(403, { error: 'TENANT_SUSPENDED' });
+  }
+  if (license.status === 'REVOKED') {
+    return json(403, { error: 'LICENSE_REVOKED' });
+  }
+  if (license.status === 'SUSPENDED') {
+    return json(403, { error: 'LICENSE_SUSPENDED' });
+  }
+  if (license.status !== 'ACTIVE') {
     return json(403, { error: 'LICENSE_NOT_ACTIVE' });
+  }
+  if (new Date(license.starts_at).getTime() > Date.now()) {
+    return json(403, { error: 'LICENSE_NOT_STARTED' });
   }
 
   if (new Date(license.expires_at).getTime() <= Date.now()) {
@@ -665,6 +703,7 @@ async function status(event) {
       l.expires_at,
       l.status,
       t.legal_name,
+      t.status AS tenant_status,
       p.code AS plan_code
     FROM licenses l
     JOIN tenants t ON t.id = l.tenant_id
@@ -681,33 +720,46 @@ async function status(event) {
 
   const license = rows[0];
 
-  if (
-    license.status === 'ACTIVE' &&
-    new Date(license.expires_at).getTime() <= Date.now()
-  ) {
+  let effectiveStatus = license.status;
+
+  if (license.status === 'REVOKED') {
+    effectiveStatus = 'REVOKED';
+  } else if (license.status === 'SUSPENDED') {
+    effectiveStatus = 'SUSPENDED';
+  } else if (license.status === 'EXPIRED') {
+    effectiveStatus = 'EXPIRED';
+  } else if (license.tenant_status === 'CLOSED') {
+    effectiveStatus = 'TENANT_CLOSED';
+  } else if (license.tenant_status !== 'ACTIVE') {
+    effectiveStatus = 'TENANT_SUSPENDED';
+  } else if (new Date(license.starts_at).getTime() > Date.now()) {
+    effectiveStatus = 'NOT_STARTED';
+  } else if (new Date(license.expires_at).getTime() <= Date.now()) {
     await db`
       UPDATE licenses
       SET status = 'EXPIRED', updated_at = now()
       WHERE id = ${license.id}
         AND status = 'ACTIVE'
     `;
-    license.status = 'EXPIRED';
+    effectiveStatus = 'EXPIRED';
   }
 
-  await db`
-    UPDATE installations
-    SET last_seen_at = now()
-    WHERE license_id = ${license.id}
-      AND installation_id = ${installationId}
-      AND status = 'ACTIVE'
-  `;
+  if (effectiveStatus === 'ACTIVE') {
+    await db`
+      UPDATE installations
+      SET last_seen_at = now()
+      WHERE license_id = ${license.id}
+        AND installation_id = ${installationId}
+        AND status = 'ACTIVE'
+    `;
+  }
 
   return json(200, {
     licenseId: license.id,
     tenantId: license.tenant_id,
     company: license.legal_name,
     plan: license.plan_code,
-    status: license.status,
+    status: effectiveStatus,
     startsAt: new Date(license.starts_at).toISOString(),
     expiresAt: new Date(license.expires_at).toISOString(),
     serverTime: new Date().toISOString()
