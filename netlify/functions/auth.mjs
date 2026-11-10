@@ -14,11 +14,24 @@ export async function hashPassword(password) {
 
 export async function verifyPassword(password, encoded) {
   try {
-    const [scheme, n, r, p, saltB64, hashB64] = String(encoded).split('$');
-    if (scheme !== 'scrypt') return false;
-    const derived = await scrypt(password, Buffer.from(saltB64, 'base64url'), 64, { N: Number(n), r: Number(r), p: Number(p) });
+    if (typeof password !== 'string' || typeof encoded !== 'string') return false;
+    const parts = encoded.split('$');
+    if (parts.length !== 6) return false;
+    const [scheme, n, r, p, saltB64, hashB64] = parts;
+
+    // Accept only the exact parameters and encoding emitted by hashPassword.
+    // This prevents attacker-controlled scrypt cost parameters in stored data.
+    if (scheme !== 'scrypt' || n !== '16384' || r !== '8' || p !== '1') return false;
+    if (!/^[A-Za-z0-9_-]{22}$/.test(saltB64) || !/^[A-Za-z0-9_-]{86}$/.test(hashB64)) return false;
+
+    const salt = Buffer.from(saltB64, 'base64url');
     const expected = Buffer.from(hashB64, 'base64url');
+    if (salt.length !== 16 || expected.length !== 64) return false;
+
+    const derived = await scrypt(password, salt, 64, { N: 16384, r: 8, p: 1 });
     const actual = Buffer.from(derived);
-    return expected.length === actual.length && timingSafeEqual(expected, actual);
-  } catch { return false; }
+    return timingSafeEqual(expected, actual);
+  } catch {
+    return false;
+  }
 }

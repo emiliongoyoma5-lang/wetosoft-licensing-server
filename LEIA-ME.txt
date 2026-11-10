@@ -1,0 +1,42 @@
+WETOSOFT — BACKEND v1.7 (CORRECÇÕES DE SEGURANÇA ADMINISTRATIVA)
+
+Base: v1.6 — Hierarquia de Administradores.
+
+Correcções desta versão
+- Impede que uma conta altere o próprio estado (suspender/reactivar-se) pelo endpoint de gestão.
+- Valida o UUID do utilizador antes da operação de alteração de estado.
+- Converte violações de unicidade PostgreSQL (SQLSTATE 23505) na criação de contas em HTTP 409 / ADMIN_IDENTIFIER_ALREADY_EXISTS.
+- Mantém a hierarquia e os restantes fluxos da v1.6.
+
+Ficheiros principais
+- netlify/functions/api.mjs: API e regras administrativas.
+- netlify/functions/auth.mjs: helpers de autenticação Scrypt.
+- index.html: painel administrativo.
+- migrations/001_admin_hierarchy.sql: migração necessária para a hierarquia; NÃO EXECUTADA.
+- tests/: testes automatizados existentes e novas verificações estáticas.
+
+Hierarquia definida
+- SUPER_ADMIN_PRINCIPAL: conta principal única; cria SUPER_ADMIN e ADMIN; gere contas subordinadas.
+- SUPER_ADMIN: cria ADMIN; gere apenas ADMIN.
+- ADMIN: não gere contas administrativas.
+- SUPPORT e AUDITOR permanecem aceites no CHECK da migração, sem serem convertidos automaticamente.
+
+Credenciais temporárias
+- Geradas pelo servidor, com validade de 24 horas.
+- Exigida alteração da palavra-passe no primeiro acesso.
+- Redefinições invalidam sessões anteriores do utilizador afectado.
+
+Validação realizada localmente
+- `npm test`: 13 testes aprovados, 0 falhas.
+- `npm run lint:syntax`: Syntax OK.
+- Os testes de hierarquia são verificações estáticas; não substituem testes HTTP/integração PostgreSQL.
+
+Pendências antes de produção
+- Inspeccionar o schema real e contar todos os SUPER_ADMIN (activos e inactivos).
+- Validar a migração numa branch de teste da Neon.
+- Testar endpoints com sessões e roles reais, incluindo concorrência e auditoria.
+- Rever a matriz de permissões dos endpoints administrativos de tenants/licenças: a hierarquia de contas não define, por si só, todas as permissões operacionais.
+- Confirmar existência/validade dos scripts declarados em package.json (generate-key e create-admin) antes de os usar.
+- Rever a apresentação e limpeza da palavra-passe temporária no painel.
+
+Não executar a migração nem fazer deploy com base apenas neste ZIP. Nenhuma alteração foi feita na Neon, GitHub ou Netlify durante esta versão.

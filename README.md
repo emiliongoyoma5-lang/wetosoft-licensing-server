@@ -1,36 +1,39 @@
-# WetoSoft Licensing Server
+# WetoSoft Licensing Server — v1.8.0 (consolidated test package)
 
-Servidor central de licenciamento do WetoSoft. O cliente WetoSoft continua local-first/offline-first; este serviço controla ativação, estado das licenças, instalações e assinatura criptográfica dos tokens.
+Backend de licenciamento e painel administrativo do WetoSoft, preparado para validação num ambiente de testes Netlify + Neon.
 
-## Arquitetura inicial de baixo custo
+## Conteúdo
 
-- Netlify Functions para a API.
-- PostgreSQL compatível com Neon Free para dados centrais.
-- Painel administrativo separado em `admin/`.
-- Chave privada Ed25519 somente no servidor.
-- Chave pública distribuída no cliente WetoSoft.
+- `netlify/functions/api.mjs`: API de autenticação administrativa, bootstrap, gestão de administradores, empresas, licenças e activações.
+- `netlify/functions/auth.mjs`: tokens de sessão, hashing Scrypt e verificação de passwords.
+- `public/index.html`: painel administrativo publicado na raiz do site.
+- `netlify.toml`: publica exclusivamente `public/`; o código das funções, migrations e scripts não fica na raiz pública.
+- `tests/`: testes unitários e verificações estáticas de contratos de segurança.
+- `migrations/001_admin_hierarchy.sql`: migration histórica da hierarquia; ver `migrations/README.md` antes de qualquer execução.
 
-## Variáveis de ambiente
+## Estado desta versão
 
-Copie `.env.example` para o ambiente de deploy e preencha:
+Esta é uma consolidação local baseada no pacote integral de 31/10 e nas correcções administrativas v1.7, mantendo as protecções posteriores da API de activação e revogação. Não foi publicada no GitHub nem no Netlify.
 
-- `DATABASE_URL`
-- `LICENSE_PRIVATE_JWK_JSON`
-- `LICENSE_PUBLIC_JWK_JSON`
-- `ADMIN_API_KEY_SHA256`
-- `LICENSE_ISSUER`
-- `LICENSE_AUDIENCE`
+## Requisitos
 
-Nunca coloque a chave privada no Git ou no PWA.
+- Node.js 24 ou superior.
+- Netlify Functions (Node 24).
+- Neon PostgreSQL com o schema compatível com o ambiente de teste.
 
-## Banco
+## Desenvolvimento e testes
 
-Execute `migrations/001_initial.sql` no PostgreSQL.
+```bash
+npm test
+npm run lint:syntax
+```
 
-## Chave de assinatura
+O conjunto actual contém testes unitários de hashing e testes estáticos de contratos/estrutura. Não substitui testes HTTP reais nem integração PostgreSQL.
 
-Execute:
+## Configuração
 
-`npm run generate-key`
+Copiar `.env.example` para `.env` apenas em ambiente local e preencher com credenciais de TESTE. No Netlify, configurar as variáveis descritas em `DEPLOY.md` no site de testes. Nunca usar a `DATABASE_URL` de produção.
 
-Guarde a chave privada apenas como secret no servidor. A chave pública será incorporada ao cliente WetoSoft em uma etapa posterior.
+## Bootstrap do administrador principal
+
+O primeiro administrador é criado pelo endpoint de bootstrap, protegido por `ADMIN_BOOTSTRAP_SECRET` e pelo estado de utilização única em `admin_bootstrap`. A criação do `SUPER_ADMIN_PRINCIPAL` não é automática. Só executar quando o responsável autorizar expressamente e estiver a usar o site de testes e a branch Neon de teste.

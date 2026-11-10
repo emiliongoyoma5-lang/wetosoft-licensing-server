@@ -8,6 +8,7 @@ const json = (statusCode, body, extra = {}) => ({
   headers: {
     'content-type': 'application/json; charset=utf-8',
     'cache-control': 'no-store',
+    'access-control-allow-origin': '*',
     'x-content-type-options': 'nosniff',
     'x-frame-options': 'DENY',
     'referrer-policy': 'no-referrer',
@@ -43,7 +44,8 @@ function bearer(event) {
 
   const cookie = header(event, 'cookie');
   const match = cookie.match(/(?:^|;\s*)ws_admin_session=([^;]+)/);
-  return match ? decodeURIComponent(match[1]) : '';
+  if (!match) return '';
+  try { return decodeURIComponent(match[1]); } catch { return ''; }
 }
 
 function secretMatches(provided, expected) {
@@ -84,6 +86,24 @@ async function signLicense(license, tenant, plan, installationId) {
     throw error;
   }
 
+  if (!jwk || typeof jwk !== 'object' || Array.isArray(jwk) || jwk.kty !== 'OKP' || jwk.crv !== 'Ed25519' || typeof jwk.d !== 'string' || typeof jwk.x !== 'string' || jwk.alg && jwk.alg !== 'EdDSA' || jwk.use && jwk.use !== 'sig') {
+    const error = new Error('LICENSE_PRIVATE_JWK_INVALID');
+    error.code = 'LICENSE_PRIVATE_JWK_INVALID';
+    throw error;
+  }
+
+  let startsAtMs;
+  let expiresAtMs;
+  try {
+    startsAtMs = new Date(license.starts_at).getTime();
+    expiresAtMs = new Date(license.expires_at).getTime();
+  } catch { /* validated below */ }
+  if (!Number.isFinite(startsAtMs) || !Number.isFinite(expiresAtMs) || expiresAtMs <= startsAtMs) {
+    const error = new Error('LICENSE_DATES_INVALID');
+    error.code = 'LICENSE_DATES_INVALID';
+    throw error;
+  }
+
   const key = await importJWK(jwk, 'EdDSA');
   const now = Math.floor(Date.now() / 1000);
 
@@ -103,17 +123,20 @@ async function signLicense(license, tenant, plan, installationId) {
     .setIssuer(process.env.LICENSE_ISSUER)
     .setAudience(process.env.LICENSE_AUDIENCE)
     .setIssuedAt(now)
+    .setNotBefore(Math.floor(startsAtMs / 1000))
+    .setExpirationTime(Math.floor(expiresAtMs / 1000))
     .setJti(`${license.id}:${installationId}`)
     .sign(key);
 }
 
-async function adminSession(event, roles = []) {
+async function adminSession(event, roles = [], allowPasswordChange = false) {
   const token = bearer(event);
   if (!token) return null;
 
   const db = getDb();
   const rows = await db`
-    SELECT u.id, u.username, u.role
+    SELECT u.id, u.username, u.display_name, u.email, u.role,
+           u.must_change_password, u.temporary_password_expires_at
     FROM admin_sessions s
     JOIN admin_users u ON u.id = s.admin_user_id
     WHERE s.token_hash = ${sha256(token)}
@@ -123,7 +146,11 @@ async function adminSession(event, roles = []) {
   `;
 
   if (!rows.length) return null;
-  if (roles.length && !roles.includes(rows[0].role)) return null;
+  if (rows[0].must_change_password && !allowPasswordChange) return null;
+  if (rows[0].temporary_password_expires_at && new Date(rows[0].temporary_password_expires_at).getTime() <= Date.now()) return null;
+  if (roles.length && !roles.includes(rows[0].role)) {
+    return { ...rows[0], _forbidden: true };
+  }
 
   await db`
     UPDATE admin_sessions
@@ -143,11 +170,13 @@ async function bootstrapAdmin(event) {
   }
 
   const input = parseBody(event);
-  if (!input?.username || !input?.password) {
+  if (!input?.username || !input?.password || !input?.displayName || !input?.email) {
     return json(400, { error: 'INVALID_REQUEST' });
   }
 
   const username = String(input.username).trim();
+  const displayName = String(input.displayName).trim();
+  const email = String(input.email).trim().toLowerCase();
   const password = String(input.password);
 
   if (!/^[A-Za-z0-9._-]{3,64}$/.test(username)) {
@@ -155,6 +184,9 @@ async function bootstrapAdmin(event) {
   }
   if (password.length < 12) {
     return json(400, { error: 'PASSWORD_TOO_SHORT' });
+  }
+  if (!displayName || displayName.length > 160 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || email.length > 254) {
+    return json(400, { error: 'INVALID_PROFILE' });
   }
 
   const db = getDb();
@@ -172,10 +204,10 @@ async function bootstrapAdmin(event) {
       RETURNING id
     ),
     inserted AS (
-      INSERT INTO admin_users(username, password_hash, role)
-      SELECT ${username}, ${passwordHash}, 'SUPER_ADMIN'
+      INSERT INTO admin_users(username, password_hash, role, display_name, email)
+      SELECT ${username}, ${passwordHash}, 'SUPER_ADMIN_PRINCIPAL', ${displayName}, ${email}
       FROM claimed
-      RETURNING id, username, role
+      RETURNING id, username, display_name, email, role
     ),
     session_created AS (
       INSERT INTO admin_sessions(admin_user_id, token_hash, expires_at)
@@ -202,7 +234,10 @@ async function bootstrapAdmin(event) {
     user: {
       id: rows[0].id,
       username: rows[0].username,
-      role: rows[0].role
+      displayName: rows[0].display_name,
+      email: rows[0].email,
+      role: rows[0].role,
+      mustChangePassword: false
     },
     expiresIn: 28800
   }, { 'set-cookie': cookie(sessionToken) });
@@ -219,7 +254,7 @@ async function login(event) {
 
   const db = getDb();
   const rows = await db`
-    SELECT id, username, password_hash, role
+    SELECT id, username, display_name, email, password_hash, role, must_change_password, temporary_password_expires_at
     FROM admin_users
     WHERE username = ${username}
       AND active = true
@@ -228,6 +263,9 @@ async function login(event) {
 
   if (!rows.length || !(await verifyPassword(input.password, rows[0].password_hash))) {
     return json(401, { error: 'INVALID_CREDENTIALS' });
+  }
+  if (rows[0].temporary_password_expires_at && new Date(rows[0].temporary_password_expires_at).getTime() <= Date.now()) {
+    return json(403, { error: 'TEMPORARY_PASSWORD_EXPIRED' });
   }
 
   const token = randomToken(32);
@@ -250,7 +288,10 @@ async function login(event) {
     user: {
       id: rows[0].id,
       username: rows[0].username,
-      role: rows[0].role
+      displayName: rows[0].display_name,
+      email: rows[0].email,
+      role: rows[0].role,
+      mustChangePassword: Boolean(rows[0].must_change_password)
     }
   }, { 'set-cookie': cookie(token) });
 }
@@ -271,14 +312,14 @@ async function logout(event) {
 }
 
 async function adminMe(event) {
-  const admin = await adminSession(event);
+  const admin = await adminSession(event, [], true);
   if (!admin) return json(401, { error: 'UNAUTHORIZED' });
+  if (admin._forbidden) return json(403, { error: 'FORBIDDEN' });
 
   return json(200, {
     user: {
-      id: admin.id,
-      username: admin.username,
-      role: admin.role
+      id: admin.id, username: admin.username, displayName: admin.display_name,
+      email: admin.email, role: admin.role, mustChangePassword: Boolean(admin.must_change_password)
     }
   });
 }
@@ -286,12 +327,175 @@ async function adminMe(event) {
 async function adminBootstrapStatus() {
   const db = getDb();
   const rows = await db`
-    SELECT EXISTS(
-      SELECT 1 FROM admin_users WHERE active = true
-    ) AS completed
+    SELECT (claimed_at IS NOT NULL OR EXISTS (SELECT 1 FROM admin_users)) AS completed
+    FROM admin_bootstrap
+    WHERE id = 1
+    LIMIT 1
   `;
 
   return json(200, { completed: Boolean(rows[0]?.completed) });
+}
+
+const ADMIN_ROLES = ['SUPER_ADMIN_PRINCIPAL', 'SUPER_ADMIN', 'ADMIN'];
+const isPrincipal = admin => admin?.role === 'SUPER_ADMIN_PRINCIPAL';
+const isSuperAdmin = admin => admin?.role === 'SUPER_ADMIN_PRINCIPAL' || admin?.role === 'SUPER_ADMIN';
+const validEmail = value => typeof value === 'string' && value.length <= 254 && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value);
+const validUsername = value => typeof value === 'string' && /^[A-Za-z0-9._-]{3,64}$/.test(value);
+
+async function adminListUsers(event) {
+  const admin = await adminSession(event);
+  if (!admin) return json(401, { error: 'UNAUTHORIZED' });
+  if (!isSuperAdmin(admin)) return json(403, { error: 'FORBIDDEN' });
+  const db = getDb();
+  const rows = await db`
+    SELECT id, username, display_name, email, role, active,
+           must_change_password, created_at, updated_at
+    FROM admin_users
+    WHERE (${isPrincipal(admin)} OR role = 'ADMIN')
+    ORDER BY created_at DESC
+    LIMIT 300
+  `;
+  return json(200, { items: rows });
+}
+
+async function adminCreateUser(event) {
+  const admin = await adminSession(event);
+  if (!admin) return json(401, { error: 'UNAUTHORIZED' });
+  if (!isSuperAdmin(admin)) return json(403, { error: 'FORBIDDEN' });
+  const input = parseBody(event);
+  if (!input || !input.username || !input.displayName || !input.email || !input.role) return json(400, { error: 'INVALID_REQUEST' });
+  const username = String(input.username).trim();
+  const displayName = String(input.displayName).trim();
+  const email = String(input.email).trim().toLowerCase();
+  const role = String(input.role).trim().toUpperCase();
+  if (!validUsername(username)) return json(400, { error: 'INVALID_USERNAME' });
+  if (!displayName || displayName.length > 160 || !validEmail(email)) return json(400, { error: 'INVALID_PROFILE' });
+  if (!['ADMIN', 'SUPER_ADMIN'].includes(role)) return json(400, { error: 'INVALID_ROLE' });
+  if (role === 'SUPER_ADMIN' && !isPrincipal(admin)) return json(403, { error: 'ONLY_PRINCIPAL_CAN_CREATE_SUPER_ADMIN' });
+
+  const temporaryPassword = randomToken(18);
+  const passwordHash = await hashPassword(temporaryPassword);
+  const db = getDb();
+  let rows;
+  try {
+    rows = await db`
+      WITH inserted AS (
+        INSERT INTO admin_users(
+          username, password_hash, role, display_name, email,
+          must_change_password, temporary_password_expires_at, created_by_admin_id
+        ) VALUES (
+          ${username}, ${passwordHash}, ${role}, ${displayName}, ${email},
+          true, now() + interval '24 hours', ${admin.id}
+        )
+        RETURNING id, username, display_name, email, role, active, created_at
+      ), audited AS (
+        INSERT INTO license_events(event, metadata)
+        SELECT 'ADMIN_USER_CREATED', ${JSON.stringify({ actorAdminId: admin.id, role })}::jsonb
+        FROM inserted RETURNING id
+      )
+      SELECT * FROM inserted
+    `;
+  } catch (error) {
+    if (error?.code === '23505') return json(409, { error: 'ADMIN_IDENTIFIER_ALREADY_EXISTS' });
+    throw error;
+  }
+  if (!rows.length) return json(500, { error: 'ADMIN_CREATE_FAILED' });
+  return json(201, { user: rows[0], temporaryPassword, temporaryPasswordExpiresIn: 86400, showTemporaryPasswordOnce: true });
+}
+
+async function adminResetUserPassword(event) {
+  const admin = await adminSession(event);
+  if (!admin) return json(401, { error: 'UNAUTHORIZED' });
+  if (!isSuperAdmin(admin)) return json(403, { error: 'FORBIDDEN' });
+  const input = parseBody(event);
+  if (!input?.userId || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(String(input.userId))) return json(400, { error: 'INVALID_USER_ID' });
+  const temporaryPassword = randomToken(18);
+  const passwordHash = await hashPassword(temporaryPassword);
+  const db = getDb();
+  const rows = await db`
+    WITH target AS (
+      SELECT id, role FROM admin_users WHERE id = ${input.userId} AND active = true
+      FOR UPDATE
+    ), changed AS (
+      UPDATE admin_users u
+      SET password_hash = ${passwordHash}, must_change_password = true,
+          temporary_password_expires_at = now() + interval '24 hours', updated_at = now()
+      FROM target t
+      WHERE u.id = t.id
+        AND ( ${isPrincipal(admin)} OR (t.role = 'ADMIN' AND isSuperAdmin(admin)) )
+        AND t.role <> 'SUPER_ADMIN_PRINCIPAL'
+      RETURNING u.id, u.username, u.role
+    ), sessions_removed AS (
+      DELETE FROM admin_sessions WHERE admin_user_id IN (SELECT id FROM changed) RETURNING id
+    ), audited AS (
+      INSERT INTO license_events(event, metadata)
+      SELECT 'ADMIN_PASSWORD_RESET', ${JSON.stringify({ actorAdminId: admin.id })}::jsonb
+      FROM changed RETURNING id
+    )
+    SELECT * FROM changed
+  `;
+  if (!rows.length) return json(404, { error: 'ADMIN_NOT_FOUND_OR_FORBIDDEN' });
+  return json(200, { user: rows[0], temporaryPassword, temporaryPasswordExpiresIn: 86400, showTemporaryPasswordOnce: true });
+}
+
+async function adminChangeOwnPassword(event) {
+  const admin = await adminSession(event, [], true);
+  if (!admin) return json(401, { error: 'UNAUTHORIZED' });
+  const input = parseBody(event);
+  if (!input || typeof input.currentPassword !== 'string' || typeof input.newPassword !== 'string') return json(400, { error: 'INVALID_REQUEST' });
+  if (input.newPassword.length < 12) return json(400, { error: 'PASSWORD_TOO_SHORT' });
+  const db = getDb();
+  const rows = await db`SELECT password_hash FROM admin_users WHERE id = ${admin.id} AND active = true LIMIT 1`;
+  if (!rows.length || !(await verifyPassword(input.currentPassword, rows[0].password_hash))) return json(401, { error: 'INVALID_CURRENT_PASSWORD' });
+  const nextHash = await hashPassword(input.newPassword);
+  const token = bearer(event);
+  await db`
+    WITH changed AS (
+      UPDATE admin_users SET password_hash = ${nextHash}, must_change_password = false,
+        temporary_password_expires_at = NULL, updated_at = now()
+      WHERE id = ${admin.id} RETURNING id
+    ), removed AS (
+      DELETE FROM admin_sessions
+      WHERE admin_user_id = ${admin.id} AND token_hash <> ${sha256(token)}
+      RETURNING id
+    )
+    INSERT INTO license_events(event, metadata)
+    SELECT 'ADMIN_PASSWORD_CHANGED', ${JSON.stringify({ adminUserId: admin.id })}::jsonb FROM changed
+  `;
+  return json(200, { ok: true, mustChangePassword: false });
+}
+
+async function adminSetUserActive(event) {
+  const admin = await adminSession(event);
+  if (!admin) return json(401, { error: 'UNAUTHORIZED' });
+  if (!isSuperAdmin(admin)) return json(403, { error: 'FORBIDDEN' });
+  const input = parseBody(event);
+  const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+  if (!input?.userId || !uuidPattern.test(String(input.userId)) || typeof input.active !== 'boolean') {
+    return json(400, { error: 'INVALID_REQUEST' });
+  }
+  if (String(input.userId).toLowerCase() === String(admin.id).toLowerCase()) {
+    return json(409, { error: 'SELF_STATUS_CHANGE_NOT_ALLOWED' });
+  }
+  const db = getDb();
+  const rows = await db`
+    WITH target AS (SELECT id, role FROM admin_users WHERE id = ${input.userId} FOR UPDATE),
+    changed AS (
+      UPDATE admin_users u SET active = ${input.active}, updated_at = now()
+      FROM target t WHERE u.id = t.id AND t.role <> 'SUPER_ADMIN_PRINCIPAL'
+        AND ( ${isPrincipal(admin)} OR t.role = 'ADMIN' )
+      RETURNING u.id, u.username, u.role, u.active
+    ), sessions_removed AS (
+      DELETE FROM admin_sessions WHERE admin_user_id IN (SELECT id FROM changed) AND ${!input.active}
+      RETURNING id
+    ), audited AS (
+      INSERT INTO license_events(event, metadata)
+      SELECT ${input.active ? 'ADMIN_USER_REACTIVATED' : 'ADMIN_USER_SUSPENDED'},
+        ${JSON.stringify({ actorAdminId: admin.id })}::jsonb FROM changed RETURNING id
+    ) SELECT * FROM changed
+  `;
+  if (!rows.length) return json(404, { error: 'ADMIN_NOT_FOUND_OR_FORBIDDEN' });
+  return json(200, { user: rows[0] });
 }
 
 /*
@@ -767,8 +971,9 @@ async function status(event) {
 }
 
 async function adminCreateTenant(event) {
-  const admin = await adminSession(event, ['SUPER_ADMIN', 'ADMIN']);
+  const admin = await adminSession(event, ['SUPER_ADMIN_PRINCIPAL', 'SUPER_ADMIN']);
   if (!admin) return json(401, { error: 'UNAUTHORIZED' });
+  if (admin._forbidden) return json(403, { error: 'FORBIDDEN' });
 
   const input = parseBody(event);
   if (!input?.legalName || !input?.email) {
@@ -776,26 +981,68 @@ async function adminCreateTenant(event) {
   }
 
   const legalName = String(input.legalName).trim();
-  const email = String(input.email).trim();
-  const nif = input.nif ? String(input.nif).trim() : null;
+  const email = String(input.email).trim().toLowerCase();
+  const nifInput = input.nif == null ? '' : String(input.nif).trim();
+  const nif = nifInput ? nifInput.toUpperCase() : null;
 
-  if (!legalName || legalName.length > 200 || !email || email.length > 254) {
+  const emailPattern = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+  if (!legalName || legalName.length > 200 || !email || email.length > 254 || !emailPattern.test(email)) {
     return json(400, { error: 'INVALID_REQUEST' });
   }
+  if (nif && nif.length > 64) return json(400, { error: 'INVALID_NIF' });
 
   const db = getDb();
+  /*
+   * Serialize requests sharing either normalized email or NIF. The locks,
+   * duplicate check and INSERT execute in one PostgreSQL statement/transaction.
+   * This protects this API path without changing the existing Neon schema.
+   */
   const rows = await db`
-    INSERT INTO tenants(legal_name, email, nif)
-    VALUES (${legalName}, ${email}, ${nif})
-    RETURNING id, legal_name, email, nif, status
+    WITH lock_keys AS MATERIALIZED (
+      SELECT lock_key
+      FROM (VALUES
+        (${'tenant-email:' + email}),
+        (${nif ? 'tenant-nif:' + nif : 'tenant-nif:none:' + email})
+      ) AS keys(lock_key)
+      ORDER BY lock_key
+    ),
+    acquired AS MATERIALIZED (
+      SELECT pg_advisory_xact_lock(hashtextextended(lock_key, 0))
+      FROM lock_keys
+    ),
+    duplicates AS MATERIALIZED (
+      SELECT t.id
+      FROM tenants t
+      CROSS JOIN acquired
+      WHERE lower(trim(t.email)) = ${email}
+         OR (${nif}::text IS NOT NULL AND upper(trim(t.nif)) = ${nif})
+      LIMIT 1
+    ),
+    inserted AS (
+      INSERT INTO tenants(legal_name, email, nif)
+      SELECT ${legalName}, ${email}, ${nif}
+      WHERE NOT EXISTS (SELECT 1 FROM duplicates)
+        AND (SELECT count(*) FROM acquired) >= 1
+      RETURNING id, legal_name, email, nif, status
+    )
+    SELECT id, legal_name, email, nif, status, false AS duplicate
+    FROM inserted
+    UNION ALL
+    SELECT NULL::uuid, NULL::text, NULL::text, NULL::text, NULL::text, true AS duplicate
+    FROM duplicates
+    WHERE NOT EXISTS (SELECT 1 FROM inserted)
   `;
 
-  return json(201, rows[0]);
+  if (rows[0]?.duplicate) return json(409, { error: 'TENANT_ALREADY_EXISTS' });
+  if (!rows.length) throw new Error('TENANT_CREATE_FAILED');
+  const { duplicate, ...tenant } = rows[0];
+  return json(201, tenant);
 }
 
 async function adminListTenants(event) {
   const admin = await adminSession(event);
   if (!admin) return json(401, { error: 'UNAUTHORIZED' });
+  if (!ADMIN_ROLES.includes(admin.role)) return json(403, { error: 'FORBIDDEN' });
 
   const db = getDb();
   const rows = await db`
@@ -809,8 +1056,9 @@ async function adminListTenants(event) {
 }
 
 async function adminCreateCode(event) {
-  const admin = await adminSession(event, ['SUPER_ADMIN', 'ADMIN']);
+  const admin = await adminSession(event, ['SUPER_ADMIN_PRINCIPAL', 'SUPER_ADMIN']);
   if (!admin) return json(401, { error: 'UNAUTHORIZED' });
+  if (admin._forbidden) return json(403, { error: 'FORBIDDEN' });
 
   const input = parseBody(event);
   if (!input?.tenantId || !input?.planCode) {
@@ -907,6 +1155,7 @@ async function adminCreateCode(event) {
 async function adminListLicenses(event) {
   const admin = await adminSession(event);
   if (!admin) return json(401, { error: 'UNAUTHORIZED' });
+  if (!ADMIN_ROLES.includes(admin.role)) return json(403, { error: 'FORBIDDEN' });
 
   const db = getDb();
   const rows = await db`
@@ -929,12 +1178,14 @@ async function adminListLicenses(event) {
 }
 
 async function adminRevoke(event) {
-  const admin = await adminSession(event, ['SUPER_ADMIN', 'ADMIN']);
+  const admin = await adminSession(event, ['SUPER_ADMIN_PRINCIPAL', 'SUPER_ADMIN']);
   if (!admin) return json(401, { error: 'UNAUTHORIZED' });
+  if (admin._forbidden) return json(403, { error: 'FORBIDDEN' });
 
   const input = parseBody(event);
-  if (!input?.licenseId) {
-    return json(400, { error: 'INVALID_REQUEST' });
+  if (typeof input?.licenseId !== 'string' ||
+      !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(input.licenseId)) {
+    return json(400, { error: 'INVALID_LICENSE_ID' });
   }
 
   const db = getDb();
@@ -943,7 +1194,7 @@ async function adminRevoke(event) {
     WITH revoked AS (
       UPDATE licenses
       SET status = 'REVOKED', updated_at = now()
-      WHERE id = ${input.licenseId}
+      WHERE id = ${input.licenseId} AND status <> 'REVOKED'
       RETURNING id, tenant_id
     ),
     installations_revoked AS (
@@ -971,7 +1222,13 @@ async function adminRevoke(event) {
     RETURNING license_id
   `;
 
-  if (!rows.length) return json(404, { error: 'LICENSE_NOT_FOUND' });
+  if (!rows.length) {
+    const current = await db`SELECT status FROM licenses WHERE id = ${input.licenseId} LIMIT 1`;
+    if (current.length && current[0].status === 'REVOKED') {
+      return json(409, { error: 'LICENSE_ALREADY_REVOKED' });
+    }
+    return json(404, { error: 'LICENSE_NOT_FOUND' });
+  }
 
   return json(200, { ok: true });
 }
@@ -984,7 +1241,7 @@ export const handler = async event => {
         headers: {
           'access-control-allow-origin': '*',
           'access-control-allow-methods': 'GET,POST,OPTIONS',
-          'access-control-allow-headers': 'content-type,authorization',
+          'access-control-allow-headers': 'content-type,authorization,x-bootstrap-secret',
           'access-control-max-age': '86400'
         },
         body: ''
@@ -998,14 +1255,28 @@ export const handler = async event => {
     if (path.endsWith('/admin/me') && event.httpMethod === 'GET') return adminMe(event);
     if (path.endsWith('/admin/bootstrap') && event.httpMethod === 'POST') return bootstrapAdmin(event);
     if (path.endsWith('/admin/bootstrap-status') && event.httpMethod === 'GET') return adminBootstrapStatus();
+    if (path.endsWith('/admin/users') && event.httpMethod === 'GET') return adminListUsers(event);
+    if (path.endsWith('/admin/users') && event.httpMethod === 'POST') return adminCreateUser(event);
+    if (path.endsWith('/admin/users/reset-password') && event.httpMethod === 'POST') return adminResetUserPassword(event);
+    if (path.endsWith('/admin/users/change-password') && event.httpMethod === 'POST') return adminChangeOwnPassword(event);
+    if (path.endsWith('/admin/users/status') && event.httpMethod === 'POST') return adminSetUserActive(event);
 
     if (event.httpMethod !== 'POST' && event.httpMethod !== 'GET') {
       return json(405, { error: 'METHOD_NOT_ALLOWED' });
     }
 
-    if (path.endsWith('/activation')) return activation(event);
-    if (path.endsWith('/license/refresh')) return refresh(event);
-    if (path.endsWith('/license/status')) return status(event);
+    if (path.endsWith('/activation')) {
+      if (event.httpMethod !== 'POST') return json(405, { error: 'METHOD_NOT_ALLOWED' }, { allow: 'POST, OPTIONS' });
+      return activation(event);
+    }
+    if (path.endsWith('/license/refresh')) {
+      if (event.httpMethod !== 'POST') return json(405, { error: 'METHOD_NOT_ALLOWED' }, { allow: 'POST, OPTIONS' });
+      return refresh(event);
+    }
+    if (path.endsWith('/license/status')) {
+      if (event.httpMethod !== 'POST') return json(405, { error: 'METHOD_NOT_ALLOWED' }, { allow: 'POST, OPTIONS' });
+      return status(event);
+    }
     if (path.endsWith('/admin/tenant') && event.httpMethod === 'POST') return adminCreateTenant(event);
     if (path.endsWith('/admin/tenants') && event.httpMethod === 'GET') return adminListTenants(event);
     if (path.endsWith('/admin/activation-code') && event.httpMethod === 'POST') return adminCreateCode(event);

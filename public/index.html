@@ -21,7 +21,9 @@ pre{white-space:pre-wrap;background:#f5f5f5;padding:10px;overflow:auto}
 <h2>Primeiro administrador</h2>
 <p>Use esta área apenas uma vez. Depois de criado o primeiro administrador, esta área fica bloqueada.</p>
 <input id="setupSecret" type="password" autocomplete="off" placeholder="Segredo de bootstrap">
-<input id="setupUser" autocomplete="username" placeholder="Novo utilizador">
+<input id="setupName" autocomplete="name" placeholder="Nome completo">
+<input id="setupEmail" type="email" autocomplete="email" placeholder="E-mail">
+<input id="setupUser" autocomplete="username" placeholder="Nome de utilizador">
 <input id="setupPass" type="password" autocomplete="new-password" placeholder="Palavra-passe (mín. 12 caracteres)">
 <button id="setupBtn">Criar administrador</button>
 <pre id="setupOut"></pre>
@@ -35,8 +37,26 @@ pre{white-space:pre-wrap;background:#f5f5f5;padding:10px;overflow:auto}
 <pre id="loginOut"></pre>
 </section>
 
+<section id="forcePassword" class="hidden">
+<h2>Definir palavra-passe pessoal</h2>
+<p>A palavra-passe temporária deve ser substituída antes de utilizar o painel.</p>
+<input id="currentPassword" type="password" autocomplete="current-password" placeholder="Palavra-passe temporária/actual">
+<input id="newPassword" type="password" autocomplete="new-password" placeholder="Nova palavra-passe (mín. 12 caracteres)">
+<button id="changePasswordBtn">Guardar nova palavra-passe</button><pre id="changePasswordOut"></pre>
+</section>
 <div id="app" class="hidden">
 <section><button id="logout">Sair</button> <span id="who"></span></section>
+<section id="adminManagement" class="hidden">
+<h2>Gestão de administradores</h2>
+<div class="grid">
+<input id="newDisplayName" placeholder="Nome completo">
+<input id="newUsername" placeholder="Nome de utilizador">
+<input id="newEmail" type="email" placeholder="E-mail">
+<select id="newRole"><option value="ADMIN">Administrador</option><option value="SUPER_ADMIN">Super Admin</option></select>
+</div>
+<button id="createAdminBtn">Criar conta</button><pre id="createAdminOut"></pre>
+<h3>Contas existentes</h3><button id="loadAdminsBtn">Actualizar lista</button><div id="adminList"></div>
+</section>
 
 <section>
 <h2>Nova empresa</h2>
@@ -83,7 +103,10 @@ const show = on => {
 };
 
 const setWho = user => {
-  $('who').textContent = `${user.username} — ${user.role}`;
+  $('who').textContent = `${user.displayName || user.username} (${user.username}) — ${user.role}`;
+  $('adminManagement').classList.toggle('hidden', !['SUPER_ADMIN_PRINCIPAL','SUPER_ADMIN'].includes(user.role));
+  $('newRole').disabled = user.role !== 'SUPER_ADMIN_PRINCIPAL';
+  if (user.role !== 'SUPER_ADMIN_PRINCIPAL') $('newRole').value = 'ADMIN';
 };
 
 const req = async (path, opt = {}) => {
@@ -116,8 +139,10 @@ async function restoreSession(){
   if (r.status === 200 && r.body.user) {
     authenticated = true;
     setWho(r.body.user);
-    show(true);
+    if (r.body.user.mustChangePassword) { $('forcePassword').classList.remove('hidden'); $('app').classList.add('hidden'); $('login').classList.add('hidden'); return true; }
+    $('forcePassword').classList.add('hidden'); show(true);
     await load();
+    if (['SUPER_ADMIN_PRINCIPAL','SUPER_ADMIN'].includes(r.body.user.role)) await loadAdmins();
     return true;
   }
   authenticated = false;
@@ -128,11 +153,13 @@ async function restoreSession(){
 async function bootstrap(){
   const secret = $('setupSecret').value;
   const username = $('setupUser').value.trim();
+  const displayName = $('setupName').value.trim();
+  const email = $('setupEmail').value.trim();
   const password = $('setupPass').value;
   const r = await req('admin/bootstrap', {
     method:'POST',
     headers:{'x-bootstrap-secret':secret},
-    body:JSON.stringify({username,password})
+    body:JSON.stringify({username,password,displayName,email})
   });
   $('setupOut').textContent = JSON.stringify(r.body,null,2);
 
@@ -163,8 +190,12 @@ async function login(){
   if (r.status === 200) {
     authenticated = true;
     setWho(r.body.user);
-    show(true);
-    await load();
+    if (r.body.user.mustChangePassword) {
+      $('forcePassword').classList.remove('hidden'); $('login').classList.add('hidden'); $('app').classList.add('hidden');
+      $('currentPassword').value = password;
+      return;
+    }
+    $('forcePassword').classList.add('hidden'); show(true); await load();
   } else {
     $('loginOut').textContent = JSON.stringify(r.body,null,2);
   }
@@ -174,6 +205,39 @@ async function load(){
   const r = await req('admin/licenses', {method:'GET'});
   $('licenses').textContent = JSON.stringify(r.body,null,2);
 }
+
+
+async function loadAdmins(){
+  const r = await req('admin/users',{method:'GET'});
+  if (r.status !== 200) { $('adminList').textContent = JSON.stringify(r.body,null,2); return; }
+  $('adminList').innerHTML = '';
+  for (const u of r.body.items || []) {
+    const row = document.createElement('div'); row.style.cssText='border-top:1px solid #ddd;padding:10px 0';
+    const title = document.createElement('strong'); title.textContent = `${u.display_name} — ${u.role}`;
+    const detail = document.createElement('p'); detail.textContent = `${u.username} · ${u.email} · ${u.active?'Activo':'Suspenso'}`;
+    row.append(title,detail);
+    if (u.role !== 'SUPER_ADMIN_PRINCIPAL') {
+      const reset = document.createElement('button'); reset.textContent='Redefinir palavra-passe';
+      reset.onclick=async()=>{ if(!confirm(`Redefinir a palavra-passe de ${u.username}?`)) return; const x=await req('admin/users/reset-password',{method:'POST',body:JSON.stringify({userId:u.id})}); $('createAdminOut').textContent=JSON.stringify(x.body,null,2); };
+      const status = document.createElement('button'); status.textContent=u.active?'Suspender':'Reactivar';
+      status.onclick=async()=>{ if(!confirm(`${u.active?'Suspender':'Reactivar'} ${u.username}?`)) return; const x=await req('admin/users/status',{method:'POST',body:JSON.stringify({userId:u.id,active:!u.active})}); $('createAdminOut').textContent=JSON.stringify(x.body,null,2); await loadAdmins(); };
+      row.append(reset,status);
+    }
+    $('adminList').append(row);
+  }
+}
+$('createAdminBtn').onclick=async()=>{
+  const payload={displayName:$('newDisplayName').value.trim(),username:$('newUsername').value.trim(),email:$('newEmail').value.trim(),role:$('newRole').value};
+  const r=await req('admin/users',{method:'POST',body:JSON.stringify(payload)});
+  $('createAdminOut').textContent=JSON.stringify(r.body,null,2);
+  if(r.status===201){$('newDisplayName').value='';$('newUsername').value='';$('newEmail').value='';await loadAdmins();}
+};
+$('loadAdminsBtn').onclick=loadAdmins;
+$('changePasswordBtn').onclick=async()=>{
+  const r=await req('admin/users/change-password',{method:'POST',body:JSON.stringify({currentPassword:$('currentPassword').value,newPassword:$('newPassword').value})});
+  $('changePasswordOut').textContent=JSON.stringify(r.body,null,2);
+  if(r.status===200){$('forcePassword').classList.add('hidden');$('currentPassword').value='';$('newPassword').value='';show(true);await load();}
+};
 
 $('setupBtn').onclick = bootstrap;
 $('loginBtn').onclick = login;

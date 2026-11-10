@@ -1,60 +1,52 @@
-# Deploy inicial — WetoSoft Licensing
+# Preparação de deploy — ambiente de TESTE
 
-## 1. PostgreSQL
+> Este documento não autoriza nem executa deploy. O pacote actual está preparado localmente; ainda falta configurar segredos e publicar manualmente no site de teste.
 
-Criar um projeto PostgreSQL gratuito no Neon e obter `DATABASE_URL` com SSL.
+## Destino permitido
 
-Executar `migrations/001_initial.sql` uma vez.
+- Netlify site: `wetosoft-licensing-test`
+- URL: `https://wetosoft-licensing-test.netlify.app`
+- Site ID: `6d1aca73-ff27-4962-b51f-0d42884ba2c6`
+- Neon project: `wandering-mode-88186149`
+- Neon branch: `br-summer-bird-zayl0nyj`
+- Database: `neondb`
 
-## 2. Chaves
+**Não utilizar** o site `wetosoft-licensing-server.netlify.app` nem a branch Neon de produção.
 
-Localmente:
+## Variáveis Netlify necessárias
 
-```bash
-npm install
-npm run generate-key
-```
+Configurar no site de teste, para o contexto Production desse site de teste (e também Deploy Previews se forem usados):
 
-Guardar `LICENSE_PRIVATE_JWK_JSON` exclusivamente como secret no Netlify.
-A chave pública (`LICENSE_PUBLIC_JWK_JSON`) será incorporada no cliente WetoSoft depois da validação do servidor.
+| Variável | Valor |
+|---|---|
+| `DATABASE_URL` | Connection string da branch Neon de teste `br-summer-bird-zayl0nyj`, base `neondb` |
+| `LICENSE_PRIVATE_JWK_JSON` | JWK privado Ed25519 gerado especificamente para teste |
+| `LICENSE_ISSUER` | `urn:wetosoft:licensing-server` |
+| `LICENSE_AUDIENCE` | `urn:wetosoft:client` |
+| `ADMIN_BOOTSTRAP_SECRET` | Segredo aleatório forte, temporário, só para o primeiro bootstrap |
 
-## 3. Chave administrativa
+Marcar `DATABASE_URL`, `LICENSE_PRIVATE_JWK_JSON` e `ADMIN_BOOTSTRAP_SECRET` como secrets. Não colocar valores em commits, ZIPs partilhados ou mensagens.
 
-Gerar uma chave longa aleatória fora do navegador e guardar somente o SHA-256 em `ADMIN_API_KEY_SHA256`.
+## Ordem segura
 
-Exemplo local:
+1. Confirmar visualmente o site e o ID acima antes de qualquer alteração.
+2. Configurar as variáveis exclusivamente no site de teste.
+3. Publicar o conteúdo deste ZIP no site de teste usando deploy manual compatível com Netlify. O `netlify.toml` define `public/` como publicação estática e `netlify/functions` como funções.
+4. Confirmar que o deploy ficou `ready`.
+5. Fazer um pedido `GET /api/v1/admin/bootstrap-status`; antes do bootstrap, o resultado esperado é `{"completed":false}`.
+6. Só após autorização expressa, executar o bootstrap de `SUPER_ADMIN_PRINCIPAL` com o segredo configurado.
+7. Confirmar login, alteração de password, logout, gestão de ADMIN/SUPER_ADMIN e matriz de permissões.
+8. Criar empresa/plano/código de activação apenas com dados de teste; validar activação, repetição idempotente, refresh, status e revogação.
+9. Depois do bootstrap bem-sucedido, remover `ADMIN_BOOTSTRAP_SECRET` do site de teste e publicar novo deploy para eliminar a variável do runtime.
 
-```bash
-node -e "const c=require('crypto'); const k=c.randomBytes(32).toString('base64url'); console.log(k); console.log(c.createHash('sha256').update(k).digest('hex'))"
-```
+## Chaves Ed25519
 
-A chave em texto é usada apenas pelo administrador; o servidor recebe-a pelo header `Authorization: Bearer ...` e compara o hash.
+`npm run generate-key` gera e imprime uma JWK privada e uma pública. Executar apenas num terminal privado. Guardar a privada num gestor de segredos/Netlify e a pública no cliente de teste. Não reutilizar a chave de produção. O script não grava ficheiros automaticamente.
 
-## 4. Netlify
+## Migration
 
-Conectar o repositório ao Netlify. O `netlify.toml` já define:
+A branch de teste já apresenta as colunas, constraints e índices da hierarquia administrativa, incluindo `SUPER_ADMIN_PRINCIPAL`, e tem `admin_users` vazio. A migration `001_admin_hierarchy.sql` é histórica e exige exactamente um `SUPER_ADMIN` antigo para promover; **não a executar novamente nesta branch**. Ver `migrations/README.md`.
 
-- publicação do painel `admin/`;
-- Functions em `netlify/functions`;
-- rota `/api/v1/*` para a Function `api`.
+## Critério de conclusão
 
-Configurar as variáveis:
-
-- `DATABASE_URL`
-- `LICENSE_PRIVATE_JWK_JSON`
-- `LICENSE_PUBLIC_JWK_JSON`
-- `ADMIN_API_KEY_SHA256`
-- `LICENSE_ISSUER`
-- `LICENSE_AUDIENCE`
-
-## 5. Primeira validação
-
-1. Criar tenant diretamente no PostgreSQL.
-2. Criar/usar um plano.
-3. Chamar `POST /api/v1/admin/activation-code` com a chave administrativa.
-4. Guardar o código devolvido uma única vez.
-5. Chamar `POST /api/v1/activation` com código + `installationId`.
-6. Verificar que o token JWS foi emitido.
-7. Repetir a ativação com o mesmo código e confirmar `409 ACTIVATION_CODE_ALREADY_USED`.
-8. Testar `/license/status` e `/license/refresh`.
-9. Revogar a licença e confirmar que o refresh deixa de funcionar.
+O Licensing Server só pode ser declarado concluído depois de testes reais no deploy de teste e na branch Neon de teste. Testes locais não comprovam integração, CORS em produção, configuração de segredos, execução de funções Netlify nem o fluxo completo de activação.
