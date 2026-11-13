@@ -16,8 +16,18 @@ test('temporary credentials require first password change and expire', () => {
   assert.match(api, /interval '24 hours'/);
 });
 test('UI contains administrator management and forced password flow', () => {
-  assert.match(ui, /Gestão de administradores/);
-  assert.match(ui, /Definir palavra-passe pessoal/);
+  assert.match(ui, /id=["']forcePassword["']/);
+  assert.match(ui, /id=["']changePasswordBtn["']/);
+  assert.match(ui, /mustChangePassword/);
+
+  assert.match(ui, /id=["']page-admins["']/);
+  assert.match(ui, /id=["']adminManagement["']/);
+  assert.match(ui, /id=["']newRole["']/);
+  assert.match(ui, /id=["']createAdminBtn["']/);
+  assert.match(ui, /id=["']loadAdminsBtn["']/);
+
+  assert.match(ui, /admin\/users\/reset-password/);
+  assert.match(ui, /admin\/users\/change-password/);
 });
 test('migration protects single principal and adds role', () => {
   assert.match(migration, /Expected exactly one existing SUPER_ADMIN/);

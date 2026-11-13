@@ -1,6 +1,6 @@
 import { neon } from '@neondatabase/serverless';
 import { SignJWT, importJWK } from 'jose';
-import { createHash, timingSafeEqual } from 'node:crypto';
+import { createHash, timingSafeEqual, createPrivateKey, createPublicKey } from 'node:crypto';
 import { randomToken, sha256, hashPassword, verifyPassword } from './auth.mjs';
 
 const json = (statusCode, body, extra = {}) => ({
@@ -72,6 +72,81 @@ function requireSigningConfig() {
     error.code = 'LICENSE_SIGNING_NOT_CONFIGURED';
     throw error;
   }
+}
+
+
+function getPublicSigningJwk() {
+  const raw = process.env.LICENSE_PRIVATE_JWK_JSON;
+
+  if (!raw) {
+    const error = new Error('LICENSE_SIGNING_NOT_CONFIGURED');
+    error.code = 'LICENSE_SIGNING_NOT_CONFIGURED';
+    throw error;
+  }
+
+  let jwk;
+  try {
+    jwk = JSON.parse(raw);
+  } catch {
+    const error = new Error('LICENSE_PRIVATE_JWK_INVALID');
+    error.code = 'LICENSE_PRIVATE_JWK_INVALID';
+    throw error;
+  }
+
+  if (
+    !jwk ||
+    typeof jwk !== 'object' ||
+    Array.isArray(jwk) ||
+    jwk.kty !== 'OKP' ||
+    jwk.crv !== 'Ed25519' ||
+    typeof jwk.d !== 'string' ||
+    typeof jwk.x !== 'string' ||
+    (jwk.alg && jwk.alg !== 'EdDSA') ||
+    (jwk.use && jwk.use !== 'sig')
+  ) {
+    const error = new Error('LICENSE_PRIVATE_JWK_INVALID');
+    error.code = 'LICENSE_PRIVATE_JWK_INVALID';
+    throw error;
+  }
+
+  try {
+    const privateKey = createPrivateKey({
+      key: jwk,
+      format: 'jwk'
+    });
+
+    const derived = createPublicKey(privateKey).export({
+      format: 'jwk'
+    });
+
+    if (
+      derived.kty !== 'OKP' ||
+      derived.crv !== 'Ed25519' ||
+      typeof derived.x !== 'string' ||
+      derived.x !== jwk.x
+    ) {
+      throw new Error('PUBLIC_PRIVATE_KEY_MISMATCH');
+    }
+
+    return {
+      kty: derived.kty,
+      crv: derived.crv,
+      x: derived.x,
+      alg: 'EdDSA',
+      use: 'sig',
+      kid: 'wetosoft-license-1'
+    };
+  } catch {
+    const error = new Error('LICENSE_PRIVATE_JWK_INVALID');
+    error.code = 'LICENSE_PRIVATE_JWK_INVALID';
+    throw error;
+  }
+}
+
+function publicSigningKey() {
+  return json(200, {
+    publicJwk: getPublicSigningJwk()
+  });
 }
 
 async function signLicense(license, tenant, plan, installationId) {
@@ -1250,6 +1325,13 @@ export const handler = async event => {
 
     const path = (event.path || '').replace(/\/+/g, '/');
 
+    if (path.endsWith('/public-key')) {
+      if (event.httpMethod !== 'GET') {
+        return json(405, { error: 'METHOD_NOT_ALLOWED' }, { allow: 'GET, OPTIONS' });
+      }
+      return publicSigningKey();
+    }
+
     if (path.endsWith('/auth/login') && event.httpMethod === 'POST') return login(event);
     if (path.endsWith('/auth/logout') && event.httpMethod === 'POST') return logout(event);
     if (path.endsWith('/admin/me') && event.httpMethod === 'GET') return adminMe(event);
@@ -1290,11 +1372,16 @@ export const handler = async event => {
       message: error?.message
     });
 
-    if (
-      error?.code === 'LICENSE_SIGNING_NOT_CONFIGURED' ||
-      error?.code === 'LICENSE_PRIVATE_JWK_INVALID'
-    ) {
-      return json(503, { error: 'LICENSE_SIGNING_NOT_CONFIGURED' });
+    if (error?.code === 'LICENSE_SIGNING_NOT_CONFIGURED') {
+      return json(503, {
+        error: 'LICENSE_SIGNING_NOT_CONFIGURED'
+      });
+    }
+
+    if (error?.code === 'LICENSE_PRIVATE_JWK_INVALID') {
+      return json(503, {
+        error: 'LICENSE_PRIVATE_JWK_INVALID'
+      });
     }
 
     return json(500, { error: 'INTERNAL_ERROR' });
