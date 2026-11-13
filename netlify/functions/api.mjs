@@ -598,7 +598,7 @@ async function activation(event) {
   const activationCode = input.activationCode.trim().toUpperCase();
   const installationId = input.installationId.trim();
 
-  if (!/^[A-Za-z0-9-]{8,128}$/.test(activationCode)) {
+  if (!/^[A-Za-z0-9_-]{8,128}$/.test(activationCode)) {
     return json(400, { error: 'INVALID_ACTIVATION_CODE' });
   }
 
